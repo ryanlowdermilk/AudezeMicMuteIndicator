@@ -2,6 +2,9 @@
 *.exe
 *.pdb
 
+# Packaged release assets
+*.zip
+
 # Generated Stream Deck plugin assets
 streamdeck/**/imgs/
 
