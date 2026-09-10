@@ -1,0 +1,40 @@
+{
+  "SDKVersion": 2,
+  "Name": "Audeze Mic Mute",
+  "Version": "1.0.0",
+  "Author": "Ryan Lowdermilk",
+  "URL": "https://github.com/ryanlowdermilk/AudezeMicMuteIndicator",
+  "Description": "Shows whether the Audeze Maxwell hardware mute switch is on or off.",
+  "Icon": "imgs/plugin",
+  "Category": "Audeze Mic Mute",
+  "CategoryIcon": "imgs/category",
+  "CodePath": "AudezeMicMuteStreamDeck.exe",
+  "OS": [
+    {
+      "Platform": "windows",
+      "MinimumVersion": "10"
+    }
+  ],
+  "Software": {
+    "MinimumVersion": "6.4"
+  },
+  "Actions": [
+    {
+      "UUID": "com.ryanlowdermilk.audezemicmute.indicator",
+      "Name": "Mic Mute Indicator",
+      "Tooltip": "Green when the Maxwell mic is live, red when the hardware mute switch is on.",
+      "Icon": "imgs/action",
+      "Controllers": [
+        "Keypad"
+      ],
+      "SupportedInMultiActions": false,
+      "UserTitleEnabled": false,
+      "States": [
+        {
+          "Image": "imgs/key",
+          "TitleAlignment": "middle"
+        }
+      ]
+    }
+  ]
+}

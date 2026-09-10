@@ -76,18 +76,24 @@ reconnect glitches; it can only ever *delay* a muted indication, never cause a f
 
 ## Privacy
 
-This app holds an open microphone stream, so it is fair to be suspicious of it. To be explicit:
+These apps hold an open microphone stream, so it is fair to be suspicious of them. To be explicit:
 
-- **It does not record, store, decode, or transmit audio.**
+- **Audio is never recorded, stored, decoded, or transmitted.**
 - Samples are read into an in-memory buffer, scanned for a single non-zero value, and overwritten
-  by the next packet.
-- The source contains **no network APIs**, **no file I/O**, no registry access, and no process
-  spawning. You can verify this by grepping [src/MicMuteIndicator.cs](src/MicMuteIndicator.cs)
-  for `System.Net`, `HttpClient`, `Socket`, or `File.`.
+  by the next packet. Nothing derived from the audio leaves the process except a single
+  three-state value: live, muted, or disconnected.
+- The **tray app** contains no network APIs, no file I/O, no registry access, and no process
+  spawning. Verify by grepping [src/MicMuteIndicator.cs](src/MicMuteIndicator.cs) for
+  `System.Net`, `HttpClient`, `Socket`, or `File.`.
+- The **Stream Deck plugin** opens exactly one network connection: a WebSocket to
+  `ws://127.0.0.1:<port>`, which is how the Stream Deck SDK requires plugins to communicate with
+  the Stream Deck application. It is loopback only, it is initiated by Stream Deck itself via
+  command-line arguments, and the only thing sent over it is a rendered PNG of a colored key.
+  There is no outbound internet traffic.
 
 Two consequences you should know about:
 
-1. Windows will show your microphone as permanently in use, and this app will appear under
+1. Windows will show your microphone as permanently in use, and these apps will appear under
    **Settings → Privacy & security → Microphone**. That is unavoidable, because sampling the
    stream is the only way this hardware exposes the switch.
 2. A *software* mute on the same endpoint also zeroes the stream, so it reads as muted too.
@@ -103,7 +109,7 @@ Requires nothing but Windows. It targets .NET Framework 4.8, which is built into
 .\build.ps1
 ```
 
-Produces a single self-contained `MicMuteIndicator.exe` of about 17 KB.
+Produces a single self-contained `MicMuteIndicator.exe` of about 23 KB.
 
 ## Usage
 
@@ -114,6 +120,41 @@ Run `MicMuteIndicator.exe`. It has no window and no installer.
 - Right-click the icon → **Show overlay on screen** for the on-monitor light. Drag it anywhere
   with the left mouse button; right-click it for the same menu.
 - Right-click → **Exit** to quit.
+
+The overlay is a per-pixel-alpha layered window, so it has no rectangular background — just a
+rounded pill with a soft drop shadow that floats cleanly over Discord, games, or anything else.
+
+| Overlay option | Effect |
+| --- | --- |
+| **Compact (dot only)** | Drops the text and shows just a glowing orb |
+| **Click-through (uncheck to move it)** | The mouse passes straight through to the app underneath. Uncheck it to drag the overlay, then re-check it. |
+| **Size** | Small / Medium / Large, scaling everything including the font |
+
+Settings are not persisted; the overlay returns to its defaults on restart.
+
+## Stream Deck plugin
+
+An optional Stream Deck plugin turns a key into a full-bleed green/red mic indicator, which is
+considerably easier to see mid-game than a tray icon.
+
+```powershell
+cd streamdeck
+.\build.ps1
+.\install.ps1
+```
+
+Then restart Stream Deck, and drag **Mic Mute Indicator** (in the *Audeze Mic Mute* category)
+onto any key. Pressing the key does nothing by design — it is a pure indicator, and no software
+can move a physical switch.
+
+The plugin runs its own detection, so it works whether or not the tray app is running. Both can
+coexist because WASAPI shared mode allows multiple capture streams. `streamdeck/build.ps1`
+compiles `src/MicMuteIndicator.cs` alongside the plugin source and uses `/main:` to select the
+entry point, so there is exactly one copy of the detection logic and the two cannot drift apart.
+
+If Stream Deck is running elevated, `install.ps1` cannot restart it for you and will tell you to
+quit and relaunch it yourself. Plugin load failures are logged to
+`%APPDATA%\Elgato\StreamDeck\logs`.
 
 | Color | Meaning |
 | --- | --- |

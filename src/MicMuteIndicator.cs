@@ -1,6 +1,8 @@
 using System;
 using System.Drawing;
 using System.Drawing.Drawing2D;
+using System.Drawing.Imaging;
+using System.Drawing.Text;
 using System.Runtime.InteropServices;
 using System.Threading;
 using System.Windows.Forms;
@@ -403,28 +405,69 @@ namespace MicMuteIndicator
         }
     }
 
+    /// <summary>
+    /// Per-pixel alpha overlay. Rendered with UpdateLayeredWindow rather than OnPaint so the
+    /// window has no rectangular background at all - only the pill, its soft shadow, and the
+    /// antialiased edges are visible against whatever is underneath.
+    /// </summary>
     public sealed class OverlayForm : Form
     {
-        [DllImport("user32.dll")] static extern bool ReleaseCapture();
-        [DllImport("user32.dll")] static extern IntPtr SendMessage(IntPtr hWnd, int msg, int wParam, int lParam);
+        const int WS_EX_LAYERED = 0x00080000;
+        const int WS_EX_TRANSPARENT = 0x00000020;
+        const int WS_EX_TOOLWINDOW = 0x00000080;
+        const int WS_EX_NOACTIVATE = 0x08000000;
+        const int GWL_EXSTYLE = -20;
         const int WM_NCLBUTTONDOWN = 0xA1;
         const int HTCAPTION = 0x2;
+        const byte AC_SRC_OVER = 0;
+        const byte AC_SRC_ALPHA = 1;
+        const int ULW_ALPHA = 2;
+
+        [StructLayout(LayoutKind.Sequential)]
+        struct POINT { public int X; public int Y; }
+
+        [StructLayout(LayoutKind.Sequential)]
+        struct SIZE { public int Cx; public int Cy; }
+
+        [StructLayout(LayoutKind.Sequential, Pack = 1)]
+        struct BLENDFUNCTION
+        {
+            public byte BlendOp;
+            public byte BlendFlags;
+            public byte SourceConstantAlpha;
+            public byte AlphaFormat;
+        }
+
+        [DllImport("user32.dll", SetLastError = true)]
+        static extern bool UpdateLayeredWindow(IntPtr hwnd, IntPtr hdcDst, ref POINT pptDst, ref SIZE psize,
+                                               IntPtr hdcSrc, ref POINT pptSrc, int crKey,
+                                               ref BLENDFUNCTION pblend, int dwFlags);
+        [DllImport("user32.dll")] static extern IntPtr GetDC(IntPtr hwnd);
+        [DllImport("user32.dll")] static extern int ReleaseDC(IntPtr hwnd, IntPtr hdc);
+        [DllImport("gdi32.dll")] static extern IntPtr CreateCompatibleDC(IntPtr hdc);
+        [DllImport("gdi32.dll")] static extern bool DeleteDC(IntPtr hdc);
+        [DllImport("gdi32.dll")] static extern IntPtr SelectObject(IntPtr hdc, IntPtr hObject);
+        [DllImport("gdi32.dll")] static extern bool DeleteObject(IntPtr hObject);
+        [DllImport("user32.dll")] static extern int GetWindowLong(IntPtr hWnd, int nIndex);
+        [DllImport("user32.dll")] static extern int SetWindowLong(IntPtr hWnd, int nIndex, int dwNewLong);
+        [DllImport("user32.dll")] static extern bool ReleaseCapture();
+        [DllImport("user32.dll")] static extern IntPtr SendMessage(IntPtr hWnd, int msg, int wParam, int lParam);
 
         MicState state = MicState.Unknown;
+        bool compact;
+        bool clickThrough;
+        float scale = 1f;
 
         public OverlayForm(ContextMenuStrip menu)
         {
             FormBorderStyle = FormBorderStyle.None;
             ShowInTaskbar = false;
             TopMost = true;
-            BackColor = Color.FromArgb(18, 18, 20);
-            ClientSize = new Size(170, 190);
             StartPosition = FormStartPosition.Manual;
-            DoubleBuffered = true;
             ContextMenuStrip = menu;
             Location = DefaultLocation();
 
-            MouseDown += (s, e) =>
+            MouseDown += delegate(object s, MouseEventArgs e)
             {
                 if (e.Button != MouseButtons.Left) return;
                 ReleaseCapture();
@@ -432,7 +475,49 @@ namespace MicMuteIndicator
             };
         }
 
+        protected override CreateParams CreateParams
+        {
+            get
+            {
+                var cp = base.CreateParams;
+                cp.ExStyle |= WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE;
+                return cp;
+            }
+        }
+
         protected override bool ShowWithoutActivation { get { return true; } }
+
+        public bool Compact
+        {
+            get { return compact; }
+            set { compact = value; Render(); }
+        }
+
+        public float OverlayScale
+        {
+            get { return scale; }
+            set { scale = value; Render(); }
+        }
+
+        /// <summary>When true the window ignores the mouse entirely so clicks reach the app beneath.</summary>
+        public bool ClickThrough
+        {
+            get { return clickThrough; }
+            set
+            {
+                clickThrough = value;
+                if (!IsHandleCreated) return;
+                int ex = GetWindowLong(Handle, GWL_EXSTYLE);
+                ex = value ? (ex | WS_EX_TRANSPARENT) : (ex & ~WS_EX_TRANSPARENT);
+                SetWindowLong(Handle, GWL_EXSTYLE, ex);
+            }
+        }
+
+        public void SetState(MicState next)
+        {
+            state = next;
+            Render();
+        }
 
         static Point DefaultLocation()
         {
@@ -442,42 +527,228 @@ namespace MicMuteIndicator
                 if (!s.Primary) { screen = s; break; }
             }
             var wa = screen.WorkingArea;
-            return new Point(wa.Right - 210, wa.Top + 40);
+            return new Point(wa.Right - 300, wa.Top + 40);
         }
 
-        public void SetState(MicState next)
+        public void Render()
         {
-            state = next;
-            Invalidate();
-        }
-
-        protected override void OnPaint(PaintEventArgs e)
-        {
-            var g = e.Graphics;
-            g.SmoothingMode = SmoothingMode.AntiAlias;
-            g.Clear(BackColor);
-
-            var color = Palette.For(state);
-            var circle = new Rectangle(25, 20, 120, 120);
-
-            using (var glow = new GraphicsPath())
+            if (!IsHandleCreated || !Visible) return;
+            using (var bmp = compact ? BuildDot() : BuildPill())
             {
-                glow.AddEllipse(circle);
-                using (var brush = new PathGradientBrush(glow))
+                Size = bmp.Size;
+                ApplyBitmap(bmp);
+            }
+        }
+
+        Bitmap BuildPill()
+        {
+            var color = Palette.For(state);
+            string label = Palette.Label(state);
+
+            using (var font = new Font("Segoe UI", 11f * scale, FontStyle.Bold, GraphicsUnit.Point))
+            {
+                SizeF textSize;
+                using (var probe = new Bitmap(1, 1))
+                using (var pg = Graphics.FromImage(probe))
                 {
-                    brush.CenterColor = ControlPaint.Light(color);
-                    brush.SurroundColors = new[] { color };
-                    g.FillEllipse(brush, circle);
+                    pg.TextRenderingHint = TextRenderingHint.AntiAlias;
+                    textSize = pg.MeasureString(label, font);
+                }
+
+                int dotSize = Round(20 * scale);
+                int padX = Round(17 * scale);
+                int gap = Round(11 * scale);
+                int shadow = Round(15 * scale);
+                int contentW = padX + dotSize + gap + (int)Math.Ceiling(textSize.Width) + padX;
+                int contentH = Round(Math.Max(dotSize + 20 * scale, textSize.Height + 17 * scale));
+
+                var bmp = new Bitmap(contentW + shadow * 2, contentH + shadow * 2, PixelFormat.Format32bppArgb);
+                using (var g = Graphics.FromImage(bmp))
+                {
+                    g.SmoothingMode = SmoothingMode.AntiAlias;
+                    g.TextRenderingHint = TextRenderingHint.AntiAlias;
+                    g.Clear(Color.Transparent);
+
+                    var rect = new Rectangle(shadow, shadow, contentW, contentH);
+                    int radius = contentH / 2;
+
+                    DrawShadow(g, rect, radius, shadow, Round(2 * scale));
+
+                    using (var path = RoundedRect(rect, radius))
+                    {
+                        using (var brush = new SolidBrush(Color.FromArgb(216, 16, 17, 21)))
+                            g.FillPath(brush, path);
+                        using (var pen = new Pen(Color.FromArgb(48, 255, 255, 255), 1f))
+                            g.DrawPath(pen, path);
+                    }
+
+                    var dotRect = new Rectangle(rect.Left + padX, rect.Top + (contentH - dotSize) / 2, dotSize, dotSize);
+                    DrawIndicator(g, dotRect, color, Round(10 * scale));
+
+                    using (var brush = new SolidBrush(Color.FromArgb(242, 255, 255, 255)))
+                    using (var fmt = new StringFormat { LineAlignment = StringAlignment.Center })
+                    {
+                        var textRect = new RectangleF(dotRect.Right + gap, rect.Top, contentW, contentH);
+                        g.DrawString(label, font, brush, textRect, fmt);
+                    }
+                }
+                return bmp;
+            }
+        }
+
+        Bitmap BuildDot()
+        {
+            var color = Palette.For(state);
+            int dotSize = Round(34 * scale);
+            int shadow = Round(17 * scale);
+            int total = dotSize + shadow * 2;
+
+            var bmp = new Bitmap(total, total, PixelFormat.Format32bppArgb);
+            using (var g = Graphics.FromImage(bmp))
+            {
+                g.SmoothingMode = SmoothingMode.AntiAlias;
+                g.Clear(Color.Transparent);
+
+                var dotRect = new Rectangle(shadow, shadow, dotSize, dotSize);
+
+                using (var path = new GraphicsPath())
+                {
+                    path.AddEllipse(dotRect);
+                    DrawShadowPath(g, path, shadow, Round(2 * scale));
+                }
+
+                using (var brush = new SolidBrush(Color.FromArgb(150, 10, 11, 14)))
+                    g.FillEllipse(brush, Rectangle.Inflate(dotRect, Round(4 * scale), Round(4 * scale)));
+
+                DrawIndicator(g, dotRect, color, Round(12 * scale));
+            }
+            return bmp;
+        }
+
+        static void DrawIndicator(Graphics g, Rectangle dotRect, Color color, int glow)
+        {
+            var glowRect = Rectangle.Inflate(dotRect, glow, glow);
+            using (var path = new GraphicsPath())
+            {
+                path.AddEllipse(glowRect);
+                using (var brush = new PathGradientBrush(path))
+                {
+                    brush.CenterColor = Color.FromArgb(140, color);
+                    brush.SurroundColors = new[] { Color.FromArgb(0, color) };
+                    g.FillEllipse(brush, glowRect);
                 }
             }
 
-            using (var pen = new Pen(Color.FromArgb(200, 255, 255, 255), 2f))
-                g.DrawEllipse(pen, circle);
+            using (var brush = new SolidBrush(color))
+                g.FillEllipse(brush, dotRect);
+            using (var pen = new Pen(Color.FromArgb(200, ControlPaint.Light(color)), 1.4f))
+                g.DrawEllipse(pen, dotRect);
+        }
 
-            using (var font = new Font("Segoe UI", 13f, FontStyle.Bold))
-            using (var brush = new SolidBrush(Color.White))
-            using (var format = new StringFormat { Alignment = StringAlignment.Center })
-                g.DrawString(Palette.Label(state), font, brush, new RectangleF(0, 150, ClientSize.Width, 30), format);
+        static void DrawShadow(Graphics g, Rectangle rect, int radius, int depth, int offsetY)
+        {
+            using (var path = RoundedRect(rect, radius))
+                DrawShadowPath(g, path, depth, offsetY);
+        }
+
+        static void DrawShadowPath(Graphics g, GraphicsPath path, int depth, int offsetY)
+        {
+            for (int i = depth; i > 0; i--)
+            {
+                double t = 1.0 - (double)i / depth;
+                int alpha = (int)(78 * t * t);
+                if (alpha <= 0) continue;
+                using (var clone = (GraphicsPath)path.Clone())
+                using (var pen = new Pen(Color.FromArgb(alpha, 0, 0, 0), i * 2f))
+                {
+                    pen.LineJoin = LineJoin.Round;
+                    var m = new Matrix();
+                    m.Translate(0, offsetY);
+                    clone.Transform(m);
+                    m.Dispose();
+                    g.DrawPath(pen, clone);
+                }
+            }
+        }
+
+        static GraphicsPath RoundedRect(Rectangle r, int radius)
+        {
+            int d = radius * 2;
+            var path = new GraphicsPath();
+            if (d <= 0) { path.AddRectangle(r); return path; }
+            path.AddArc(r.Left, r.Top, d, d, 180, 90);
+            path.AddArc(r.Right - d, r.Top, d, d, 270, 90);
+            path.AddArc(r.Right - d, r.Bottom - d, d, d, 0, 90);
+            path.AddArc(r.Left, r.Bottom - d, d, d, 90, 90);
+            path.CloseFigure();
+            return path;
+        }
+
+        static int Round(double value) { return (int)Math.Round(value); }
+
+        void ApplyBitmap(Bitmap bitmap)
+        {
+            Premultiply(bitmap);
+
+            IntPtr screenDc = GetDC(IntPtr.Zero);
+            IntPtr memDc = CreateCompatibleDC(screenDc);
+            IntPtr hBitmap = IntPtr.Zero;
+            IntPtr oldBitmap = IntPtr.Zero;
+
+            try
+            {
+                hBitmap = bitmap.GetHbitmap(Color.FromArgb(0));
+                oldBitmap = SelectObject(memDc, hBitmap);
+
+                var size = new SIZE { Cx = bitmap.Width, Cy = bitmap.Height };
+                var source = new POINT { X = 0, Y = 0 };
+                var dest = new POINT { X = Left, Y = Top };
+                var blend = new BLENDFUNCTION
+                {
+                    BlendOp = AC_SRC_OVER,
+                    BlendFlags = 0,
+                    SourceConstantAlpha = 255,
+                    AlphaFormat = AC_SRC_ALPHA
+                };
+
+                UpdateLayeredWindow(Handle, screenDc, ref dest, ref size, memDc, ref source, 0, ref blend, ULW_ALPHA);
+            }
+            finally
+            {
+                ReleaseDC(IntPtr.Zero, screenDc);
+                if (hBitmap != IntPtr.Zero)
+                {
+                    SelectObject(memDc, oldBitmap);
+                    DeleteObject(hBitmap);
+                }
+                DeleteDC(memDc);
+            }
+        }
+
+        /// <summary>UpdateLayeredWindow expects premultiplied alpha; GDI+ produces straight alpha.</summary>
+        static void Premultiply(Bitmap bmp)
+        {
+            var rect = new Rectangle(0, 0, bmp.Width, bmp.Height);
+            var data = bmp.LockBits(rect, ImageLockMode.ReadWrite, PixelFormat.Format32bppArgb);
+            try
+            {
+                int length = Math.Abs(data.Stride) * data.Height;
+                var buffer = new byte[length];
+                Marshal.Copy(data.Scan0, buffer, 0, length);
+
+                for (int i = 0; i + 3 < length; i += 4)
+                {
+                    byte a = buffer[i + 3];
+                    if (a == 255) continue;
+                    if (a == 0) { buffer[i] = 0; buffer[i + 1] = 0; buffer[i + 2] = 0; continue; }
+                    buffer[i] = (byte)(buffer[i] * a / 255);
+                    buffer[i + 1] = (byte)(buffer[i + 1] * a / 255);
+                    buffer[i + 2] = (byte)(buffer[i + 2] * a / 255);
+                }
+
+                Marshal.Copy(buffer, 0, data.Scan0, length);
+            }
+            finally { bmp.UnlockBits(data); }
         }
     }
 
@@ -490,6 +761,7 @@ namespace MicMuteIndicator
         readonly OverlayForm overlay;
         readonly Control marshaler;
         readonly ToolStripMenuItem overlayItem;
+        readonly ToolStripMenuItem[] sizeItems;
         Icon currentIcon;
 
         public TrayContext()
@@ -498,15 +770,47 @@ namespace MicMuteIndicator
             marshaler.CreateControl();
 
             var menu = new ContextMenuStrip();
+
             overlayItem = new ToolStripMenuItem("Show overlay on screen");
             overlayItem.CheckOnClick = true;
-            overlayItem.Click += (s, e) =>
+            overlayItem.Click += delegate
             {
-                if (overlayItem.Checked) overlay.Show(); else overlay.Hide();
+                if (overlayItem.Checked) { overlay.Show(); overlay.Render(); }
+                else overlay.Hide();
             };
             menu.Items.Add(overlayItem);
+
+            var compactItem = new ToolStripMenuItem("Compact (dot only)");
+            compactItem.CheckOnClick = true;
+            compactItem.Click += delegate { overlay.Compact = compactItem.Checked; };
+            menu.Items.Add(compactItem);
+
+            var clickThroughItem = new ToolStripMenuItem("Click-through (uncheck to move it)");
+            clickThroughItem.CheckOnClick = true;
+            clickThroughItem.Click += delegate { overlay.ClickThrough = clickThroughItem.Checked; };
+            menu.Items.Add(clickThroughItem);
+
+            sizeItems = new[]
+            {
+                new ToolStripMenuItem("Small"),
+                new ToolStripMenuItem("Medium"),
+                new ToolStripMenuItem("Large")
+            };
+            sizeItems[0].Tag = 0.8f;
+            sizeItems[1].Tag = 1.0f;
+            sizeItems[2].Tag = 1.35f;
+            sizeItems[1].Checked = true;
+
+            var sizeMenu = new ToolStripMenuItem("Size");
+            foreach (var item in sizeItems)
+            {
+                item.Click += OnSizeClicked;
+                sizeMenu.DropDownItems.Add(item);
+            }
+            menu.Items.Add(sizeMenu);
+
             menu.Items.Add(new ToolStripSeparator());
-            menu.Items.Add("Exit", null, (s, e) => ExitApp());
+            menu.Items.Add("Exit", null, delegate { ExitApp(); });
 
             overlay = new OverlayForm(menu);
 
@@ -518,6 +822,13 @@ namespace MicMuteIndicator
             monitor = new MicMonitor("Maxwell");
             monitor.StateChanged += OnStateChanged;
             monitor.Start();
+        }
+
+        void OnSizeClicked(object sender, EventArgs e)
+        {
+            var clicked = (ToolStripMenuItem)sender;
+            foreach (var item in sizeItems) item.Checked = ReferenceEquals(item, clicked);
+            overlay.OverlayScale = (float)clicked.Tag;
         }
 
         void OnStateChanged(MicState state, string deviceName)
